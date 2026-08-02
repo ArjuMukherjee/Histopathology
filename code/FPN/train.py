@@ -16,6 +16,7 @@ from sklearn.metrics import (
 
 import numpy as np
 import os
+import gc
 
 from seg_head import SegModel
 from dataset import MoNuSegDataset
@@ -26,7 +27,9 @@ from loss import total_loss
 # Hyperparameters
 # =========================
 epochs = 100
-batch = 8
+effective_batch_size = 8
+micro_batch_size = 1  # Full precision FP32 requires physical batch size 1 to fit VRAM
+accumulation_steps = max(1, effective_batch_size // micro_batch_size)
 
 
 # =========================
@@ -36,7 +39,6 @@ def dice_score(preds, targets, smooth=1e-6):
     """
     Dice Score between predicted mask and ground truth mask
     """
-
     preds = preds.astype(np.float32)
     targets = targets.astype(np.float32)
 
@@ -76,14 +78,13 @@ def evaluate(model, loader, device):
         )
 
     with torch.no_grad():
-
         for imgs, masks in loader:
 
             imgs = imgs.to(device)
             masks = masks.to(device)
 
+            # Full FP32 evaluation
             preds = model(imgs)
-
             loss = total_loss(preds, masks)
 
             running_loss += loss.item()
@@ -115,9 +116,7 @@ def evaluate(model, loader, device):
             # Flatten for Metrics
             # -------------------------
             prob_flat = probs.cpu().numpy().flatten()
-
             pred_flat = pred_np.astype(np.uint8).flatten()
-
             mask_flat = mask_np.astype(np.uint8).flatten()
 
             # -------------------------
@@ -153,18 +152,26 @@ test_mask = "../MonuSeg/MonuSeg/Test/GroundTruth"
 # =========================
 # Dataset & DataLoader
 # =========================
-train_ds = MoNuSegDataset(train_img, train_mask)
-test_ds = MoNuSegDataset(test_img, test_mask)
+train_ds = MoNuSegDataset(
+    train_img,
+    train_mask,
+    target_size=(512, 512),  # Kept full 512x512 resolution
+    augment=True,
+    augment_prob=0.5,
+    rotation_range=(-15, 15),
+    scale_range=(0.9, 1.1)
+)
+test_ds = MoNuSegDataset(test_img, test_mask, target_size=(512, 512))
 
 train_loader = DataLoader(
     train_ds,
-    batch_size=batch,
+    batch_size=micro_batch_size,  # Set to 1 for standard FP32
     shuffle=True
 )
 
 test_loader = DataLoader(
     test_ds,
-    batch_size=batch,
+    batch_size=micro_batch_size,
     shuffle=False
 )
 
@@ -177,10 +184,11 @@ device = torch.device(
 )
 
 print(f"Using Device: {device}")
+print(f"Full Precision (FP32) | Effective Batch Size: {effective_batch_size} (Micro-batch: {micro_batch_size}, Accumulation Steps: {accumulation_steps})")
 
 
 # =========================
-# Model
+# Model & Optimizer
 # =========================
 model = SegModel().to(device)
 
@@ -213,25 +221,37 @@ print("\nStarting Training...\n")
 for epoch in range(epochs):
 
     model.train()
-
     running_train_loss = 0.0
+    optimizer.zero_grad()
 
-    for imgs, masks in train_loader:
+    for i, (imgs, masks) in enumerate(train_loader):
 
         imgs = imgs.to(device)
         masks = masks.to(device)
 
-        optimizer.zero_grad()
-
+        # FP32 Forward Pass
         preds = model(imgs)
+        
+        # Calculate loss and scale down by accumulation steps
+        loss = total_loss(preds, masks) / accumulation_steps
 
-        loss = total_loss(preds, masks)
-
+        # Backward Pass
         loss.backward()
 
-        optimizer.step()
+        # Step optimizer every 'accumulation_steps'
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            optimizer.zero_grad()
 
-        running_train_loss += loss.item()
+        running_train_loss += loss.item() * accumulation_steps
+
+    # Clear VRAM cache between train and eval steps
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
 
     # -------------------------
     # Average Train Loss
@@ -249,22 +269,15 @@ for epoch in range(epochs):
         avg_dice
     ) = evaluate(model, test_loader, device)
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     # -------------------------
     # Store History
     # -------------------------
     train_history.append(avg_train_loss)
-
     test_history.append(avg_test_loss)
-
     dice_history.append(avg_dice)
-
-    # -------------------------
-    # Save Checkpoint
-    # -------------------------
-    # torch.save(
-    #     model.state_dict(),
-    #     f"checkpoints/fpn_epoch_{epoch+1}.pth"
-    # )
 
     # -------------------------
     # Print Progress
@@ -290,20 +303,13 @@ torch.save(
 # Plot Loss Curve
 # =========================
 plt.figure(figsize=(10, 5))
-
 plt.plot(train_history, label="Train Loss")
-
 plt.plot(test_history, label="Test Loss")
-
 plt.xlabel("Epochs")
 plt.ylabel("Loss")
-
 plt.title("Training vs Test Loss")
-
 plt.legend()
-
 plt.savefig("Results/loss_curve.png")
-
 plt.close()
 
 
@@ -311,18 +317,12 @@ plt.close()
 # Plot Dice Curve
 # =========================
 plt.figure(figsize=(10, 5))
-
 plt.plot(dice_history, label="Dice Score")
-
 plt.xlabel("Epochs")
 plt.ylabel("Dice Score")
-
 plt.title("Dice Score vs Epochs")
-
 plt.legend()
-
 plt.savefig("Results/dice_curve.png")
-
 plt.close()
 
 
@@ -330,18 +330,13 @@ plt.close()
 # Confusion Matrix
 # =========================
 cm = confusion_matrix(y_true, y_pred)
-
 disp = ConfusionMatrixDisplay(
     confusion_matrix=cm,
     display_labels=["Background", "Nuclei"]
 )
-
 disp.plot(cmap=plt.cm.Blues)
-
 plt.title("Pixel-level Confusion Matrix")
-
 plt.savefig("Results/confusion_matrix.png")
-
 plt.close()
 
 
@@ -349,15 +344,10 @@ plt.close()
 # Final Metrics
 # =========================
 precision = precision_score(y_true, y_pred)
-
 recall = recall_score(y_true, y_pred)
-
 f1 = f1_score(y_true, y_pred)
-
 accuracy = accuracy_score(y_true, y_pred)
-
 iou = jaccard_score(y_true, y_pred)
-
 auc = roc_auc_score(y_true, y_prob)
 
 
@@ -365,29 +355,18 @@ auc = roc_auc_score(y_true, y_prob)
 # Print Final Metrics
 # =========================
 print("\n" + "=" * 40)
-
 print(" FINAL EVALUATION METRICS ")
-
 print("=" * 40)
-
 print(f"Accuracy     : {accuracy:.4f}")
-
 print(f"Precision    : {precision:.4f}")
-
 print(f"Recall       : {recall:.4f}")
-
 print(f"F1-Score     : {f1:.4f}")
-
 print(f"Dice Score   : {avg_dice:.4f}")
-
 print(f"IoU          : {iou:.4f}")
-
 print(f"AUC          : {auc:.4f}")
-
 print("=" * 40)
 
 print("\nTraining Complete!")
-
 print("Saved Files:")
 print("1. Results/loss_curve.png")
 print("2. Results/dice_curve.png")
