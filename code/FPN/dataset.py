@@ -3,30 +3,73 @@ import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split
+
+
+def list_image_files(img_dir, extensions=None):
+    if extensions is None:
+        extensions = (".png", ".tif", ".tiff", ".jpg", ".jpeg")
+    return sorted(
+        [
+            f
+            for f in os.listdir(img_dir)
+            if f.lower().endswith(extensions)
+        ]
+    )
+
+
+def split_image_list(image_files, test_size=0.1, val_size=0.1, random_state=None):
+    if val_size < 0 or test_size < 0 or val_size + test_size >= 1.0:
+        raise ValueError("val_size and test_size must be non-negative and sum to less than 1.0")
+
+    train_val, test_files = train_test_split(
+        image_files,
+        test_size=test_size,
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    if val_size == 0.0:
+        return train_val, [], test_files
+
+    val_fraction = val_size / (1.0 - test_size)
+    train_files, val_files = train_test_split(
+        train_val,
+        test_size=val_fraction,
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    return train_files, val_files, test_files
+
 
 class MoNuSegDataset(Dataset):
     def __init__(
-        self, 
-        img_dir, 
-        mask_dir, 
-        target_size=(512, 512), 
-        augment=False, 
+        self,
+        img_dir,
+        mask_dir,
+        target_size=(512, 512),
+        augment=False,
         augment_factor=1,
-        augment_prob=0.5, # <--- 1. Added argument with a default value (50% chance)
-        rotation_range=(-15, 15), 
-        scale_range=(0.9, 1.1)
+        augment_prob=0.5,
+        rotation_range=(-15, 15),
+        scale_range=(0.9, 1.1),
+        image_list=None,
     ):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
-        self.target_size = target_size
+        self.target_size = tuple(target_size)
         self.augment = augment
         self.augment_factor = augment_factor
-        self.augment_probability = augment_prob # <--- Store probability
+        self.augment_probability = augment_prob
         self.rotation_range = rotation_range
         self.scale_range = scale_range
-        
-        valid_extensions = ('.png', '.tif', '.tiff', '.jpg', '.jpeg')
-        self.images = [f for f in os.listdir(img_dir) if f.lower().endswith(valid_extensions)]
+
+        valid_extensions = (".png", ".tif", ".tiff", ".jpg", ".jpeg")
+        if image_list is None:
+            self.images = list_image_files(img_dir, extensions=valid_extensions)
+        else:
+            self.images = [f for f in image_list if f.lower().endswith(valid_extensions)]
 
         self.samples = []
         for img_name in self.images:
@@ -37,11 +80,6 @@ class MoNuSegDataset(Dataset):
 
         if self.augment:
             np.random.shuffle(self.samples)
-
-        print(
-            f"Dataset initialized with {len(self.images)} original images from {img_dir} "
-            f"and {len(self.samples) - len(self.images)} augmented entries, total entries={len(self.samples)}"
-        )
 
     def __len__(self):
         return len(self.samples)
@@ -74,37 +112,34 @@ class MoNuSegDataset(Dataset):
         sample = self.samples[idx]
         img_name = sample["img_name"]
         should_augment = sample["augment"]
-        
-        # 1. Image Loading
+
         img_path = os.path.join(self.img_dir, img_name)
         img = cv2.imread(img_path)
         if img is None:
             raise FileNotFoundError(f"Could not read image: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # 2. Mask Loading
-        base_name = os.path.splitext(img_name)[0] 
-        mask_name = f"{base_name}_bin_mask.png" 
+        base_name = os.path.splitext(img_name)[0]
+        mask_name = f"{base_name}_bin_mask.png"
         mask_path = os.path.join(self.mask_dir, mask_name)
         mask = cv2.imread(mask_path, 0)
-        
         if mask is None:
-            raise FileNotFoundError(f"Could not find mask at {mask_path}")
+            mask_path = os.path.join(self.mask_dir, f"{base_name}.png")
+            mask = cv2.imread(mask_path, 0)
+            if mask is None:
+                raise FileNotFoundError(f"Could not find mask for {img_name} at {self.mask_dir}")
 
-        # 3. Resize to target size
         img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
 
-        # 4. Apply augmentation based on probability
-        # <--- 2. Modified condition to check against random probability
         if should_augment and (np.random.rand() < self.augment_probability):
             img, mask = self._augment_pair(img, mask)
 
-        # 5. Processing
+        # Ensure contiguous memory before tensor conversion
+        img = np.ascontiguousarray(img)
+        mask = np.ascontiguousarray(mask)
+
         mask = (mask > 0).astype("float32")
-
-        # Convert to Tensors: (C, H, W)
-        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        mask = torch.from_numpy(mask).unsqueeze(0)
-
-        return img, mask
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+        return img_tensor, mask_tensor

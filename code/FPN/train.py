@@ -1,374 +1,292 @@
+import argparse
+import csv
+import os
+import time
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
 import torch.optim as optim
-import matplotlib.pyplot as plt
-
 from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
+    accuracy_score,
+    f1_score,
+    jaccard_score,
     precision_score,
     recall_score,
-    f1_score,
-    accuracy_score,
-    jaccard_score,
-    roc_auc_score
 )
+from torch.utils.data import DataLoader
 
-import numpy as np
-import os
-import gc
-
-from seg_head import SegModel
-from dataset import MoNuSegDataset
+from dataset import MoNuSegDataset, list_image_files, split_image_list
 from loss import total_loss
+from seg_head import SegModel
 
 
-# =========================
-# Hyperparameters
-# =========================
-epochs = 100
-effective_batch_size = 8
-micro_batch_size = 1  # Full precision FP32 requires physical batch size 1 to fit VRAM
-accumulation_steps = max(1, effective_batch_size // micro_batch_size)
-
-
-# =========================
-# Dice Score Function
-# =========================
 def dice_score(preds, targets, smooth=1e-6):
-    """
-    Dice Score between predicted mask and ground truth mask
-    """
-    preds = preds.astype(np.float32)
-    targets = targets.astype(np.float32)
+  preds = preds.astype(np.float32)
+  targets = targets.astype(np.float32)
+  intersection = np.sum(preds * targets)
+  return (2.0 * intersection + smooth) / (
+      np.sum(preds) + np.sum(targets) + smooth
+  )
 
-    intersection = np.sum(preds * targets)
+def set_bn_eval(m):
+  classname = m.__class__.__name__
+  if "BatchNorm" in classname:
+    m.eval()
 
-    dice = (2.0 * intersection + smooth) / (
-        np.sum(preds) + np.sum(targets) + smooth
-    )
-
-    return dice
-
-
-# =========================
-# Evaluation Function
-# =========================
 def evaluate(model, loader, device):
+  model.eval()
+  running_loss = 0.0
+  all_preds_bin = []
+  all_masks = []
+  dice_scores = []
 
-    model.eval()
+  with torch.no_grad():
+    for imgs, masks in loader:
+      imgs, masks = imgs.to(device), masks.to(device)
+      preds = model(imgs)
+      loss = total_loss(preds, masks)
+      running_loss += loss.item()
 
-    running_loss = 0.0
+      probs = torch.sigmoid(preds)
+      print(f"DEBUG: prob min={probs.min().item():.3f}, max={probs.max().item():.3f}, mean={probs.mean().item():.3f}")
+      pred_bin = (probs > 0.5).float().cpu().numpy()
+      mask_np = masks.cpu().numpy()
 
-    all_preds_bin = []
-    all_masks = []
-    all_probs = []
+      dice_scores.append(dice_score(pred_bin, mask_np))
+      all_preds_bin.append(pred_bin.astype(np.uint8).flatten())
+      all_masks.append(mask_np.astype(np.uint8).flatten())
 
-    dice_scores = []
+  all_masks = np.concatenate(all_masks)
+  all_preds_bin = np.concatenate(all_preds_bin)
 
-    if len(loader) == 0:
-        print("Warning: Loader is empty!")
+  val_loss = running_loss / len(loader)
+  mean_dice = np.mean(dice_scores)
+  iou = jaccard_score(all_masks, all_preds_bin, zero_division=0)
+  acc = accuracy_score(all_masks, all_preds_bin)
+  prec = precision_score(all_masks, all_preds_bin, zero_division=0)
+  rec = recall_score(all_masks, all_preds_bin, zero_division=0)
+  f1 = f1_score(all_masks, all_preds_bin, zero_division=0)
 
-        return (
-            0.0,
-            np.array([]),
-            np.array([]),
-            np.array([]),
-            0.0
-        )
+  return val_loss, mean_dice, iou, acc, prec, rec, f1
 
-    with torch.no_grad():
-        for imgs, masks in loader:
 
-            imgs = imgs.to(device)
-            masks = masks.to(device)
+def train(args):
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  os.makedirs(args.save_dir, exist_ok=True)
 
-            # Full FP32 evaluation
-            preds = model(imgs)
-            loss = total_loss(preds, masks)
+  all_files = list_image_files(args.train_img_dir)
+  train_files, val_files, _ = split_image_list(
+      all_files, test_size=0.1, val_size=0.15, random_state=42
+  )
 
-            running_loss += loss.item()
+  train_ds = MoNuSegDataset(
+      args.train_img_dir,
+      args.train_mask_dir,
+      target_size=args.target_size,
+      augment=args.augment,
+      augment_factor=args.augment_factor,
+      augment_prob=args.augment_prob,
+      rotation_range=args.rotation_range,
+      scale_range=args.scale_range,
+      image_list=train_files,
+  )
+  val_ds = MoNuSegDataset(
+      args.train_img_dir,
+      args.train_mask_dir,
+      target_size=args.target_size,
+      augment=False,
+      image_list=val_files,
+  )
 
-            # -------------------------
-            # Probability Mask
-            # -------------------------
-            probs = torch.sigmoid(preds)
+  train_loader = DataLoader(
+      train_ds,
+      batch_size=args.batch_size,
+      shuffle=True,
+      num_workers=args.num_workers,
+      pin_memory=True,
+  )
+  val_loader = DataLoader(
+      val_ds,
+      batch_size=args.batch_size,
+      shuffle=False,
+      num_workers=args.num_workers,
+      pin_memory=True,
+  )
 
-            # -------------------------
-            # Binary Prediction Mask
-            # -------------------------
-            pred_bin = (probs > 0.5).float()
+  model = SegModel(
+      backbone_name=args.backbone,
+      pretrained=args.pretrained,
+      num_classes=args.num_classes,
+  ).to(device)
 
-            # -------------------------
-            # Convert to numpy
-            # -------------------------
-            pred_np = pred_bin.cpu().numpy()
-            mask_np = masks.cpu().numpy()
-
-            # -------------------------
-            # Dice Score
-            # -------------------------
-            batch_dice = dice_score(pred_np, mask_np)
-
-            dice_scores.append(batch_dice)
-
-            # -------------------------
-            # Flatten for Metrics
-            # -------------------------
-            prob_flat = probs.cpu().numpy().flatten()
-            pred_flat = pred_np.astype(np.uint8).flatten()
-            mask_flat = mask_np.astype(np.uint8).flatten()
-
-            # -------------------------
-            # Subsample pixels
-            # -------------------------
-            step = 10
-
-            all_probs.append(prob_flat[::step])
-            all_preds_bin.append(pred_flat[::step])
-            all_masks.append(mask_flat[::step])
-
-    mean_dice = np.mean(dice_scores)
-
-    return (
-        running_loss / len(loader),
-        np.concatenate(all_masks),
-        np.concatenate(all_preds_bin),
-        np.concatenate(all_probs),
-        mean_dice
+  # Load UNITPathSSL Pretrained Weights if provided
+  if args.pretrained_weights and os.path.exists(args.pretrained_weights):
+    print(
+        f"Loading UNITPathSSL pretrained checkpoint from:"
+        f" {args.pretrained_weights}"
     )
+    checkpoint = torch.load(args.pretrained_weights, map_location=device)
+    state_dict = (
+        checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    )
+    model.load_state_dict(state_dict, strict=False)
 
+  optimizer = optim.Adam(
+      model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+  )
+  scheduler = optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max=args.epochs, eta_min=1e-6
+  )
 
-# =========================
-# Dataset Paths
-# =========================
-train_img = "../MonuSeg/MonuSeg/Training/TissueImages"
-train_mask = "../MonuSeg/MonuSeg/Training/GroundTruth"
+  best_val_dice = 0.0
+  best_checkpoint = os.path.join(args.save_dir, f"{args.backbone}_best.pth")
+  last_checkpoint = os.path.join(args.save_dir, f"{args.backbone}_last.pth")
+  log_csv_path = os.path.join(
+      args.save_dir, f"{args.backbone}_training_metrics.csv"
+  )
 
-test_img = "../MonuSeg/MonuSeg/Test/TissueImages"
-test_mask = "../MonuSeg/MonuSeg/Test/GroundTruth"
+  csv_headers = [
+      "epoch",
+      "train_loss",
+      "val_loss",
+      "val_dice",
+      "val_iou",
+      "val_accuracy",
+      "val_precision",
+      "val_recall",
+      "val_f1",
+      "lr",
+      "epoch_time_sec",
+  ]
+  with open(log_csv_path, mode="w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(csv_headers)
 
+  print(
+      f"Starting training: Backbone={args.backbone}, Epochs={args.epochs},"
+      f" BatchSize={args.batch_size}, LR={args.lr}"
+  )
 
-# =========================
-# Dataset & DataLoader
-# =========================
-train_ds = MoNuSegDataset(
-    train_img,
-    train_mask,
-    target_size=(512, 512),  # Kept full 512x512 resolution
-    augment=True,
-    augment_prob=0.5,
-    rotation_range=(-15, 15),
-    scale_range=(0.9, 1.1)
-)
-test_ds = MoNuSegDataset(test_img, test_mask, target_size=(512, 512))
+  epoch_durations = []
+  total_start_time = time.time()
 
-train_loader = DataLoader(
-    train_ds,
-    batch_size=micro_batch_size,  # Set to 1 for standard FP32
-    shuffle=True
-)
-
-test_loader = DataLoader(
-    test_ds,
-    batch_size=micro_batch_size,
-    shuffle=False
-)
-
-
-# =========================
-# Device
-# =========================
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-print(f"Using Device: {device}")
-print(f"Full Precision (FP32) | Effective Batch Size: {effective_batch_size} (Micro-batch: {micro_batch_size}, Accumulation Steps: {accumulation_steps})")
-
-
-# =========================
-# Model & Optimizer
-# =========================
-model = SegModel().to(device)
-
-optimizer = optim.Adam(
-    model.parameters(),
-    lr=1e-4
-)
-
-
-# =========================
-# Create Folders
-# =========================
-os.makedirs("checkpoints", exist_ok=True)
-os.makedirs("Results", exist_ok=True)
-
-
-# =========================
-# History
-# =========================
-train_history = []
-test_history = []
-dice_history = []
-
-
-# =========================
-# Training
-# =========================
-print("\nStarting Training...\n")
-
-for epoch in range(epochs):
-
+  for epoch in range(1, args.epochs + 1):
+    epoch_start_time = time.time()
     model.train()
-    running_train_loss = 0.0
+    model.apply(
+        set_bn_eval
+    )
+    running_loss = 0.0
     optimizer.zero_grad()
 
     for i, (imgs, masks) in enumerate(train_loader):
+      imgs, masks = imgs.to(device), masks.to(device)
+      preds = model(imgs)
+      loss = total_loss(preds, masks) / args.accumulation_steps
+      loss.backward()
 
-        imgs = imgs.to(device)
-        masks = masks.to(device)
+      if (i + 1) % args.accumulation_steps == 0 or (i + 1) == len(train_loader):
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
-        # FP32 Forward Pass
-        preds = model(imgs)
-        
-        # Calculate loss and scale down by accumulation steps
-        loss = total_loss(preds, masks) / accumulation_steps
+      running_loss += loss.item() * args.accumulation_steps
 
-        # Backward Pass
-        loss.backward()
+    current_lr = optimizer.param_groups[0]["lr"]
+    scheduler.step()
 
-        # Step optimizer every 'accumulation_steps'
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            optimizer.zero_grad()
-
-        running_train_loss += loss.item() * accumulation_steps
-
-    # Clear VRAM cache between train and eval steps
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    gc.collect()
-
-    # -------------------------
-    # Average Train Loss
-    # -------------------------
-    avg_train_loss = running_train_loss / len(train_loader)
-
-    # -------------------------
-    # Evaluation
-    # -------------------------
-    (
-        avg_test_loss,
-        y_true,
-        y_pred,
-        y_prob,
-        avg_dice
-    ) = evaluate(model, test_loader, device)
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    # -------------------------
-    # Store History
-    # -------------------------
-    train_history.append(avg_train_loss)
-    test_history.append(avg_test_loss)
-    dice_history.append(avg_dice)
-
-    # -------------------------
-    # Print Progress
-    # -------------------------
-    print(
-        f"Epoch [{epoch+1}/{epochs}] | "
-        f"Train Loss: {avg_train_loss:.4f} | "
-        f"Test Loss: {avg_test_loss:.4f} | "
-        f"Dice Score: {avg_dice:.4f}"
+    train_loss = running_loss / len(train_loader)
+    val_loss, val_dice, val_iou, val_acc, val_prec, val_rec, val_f1 = evaluate(
+        model, val_loader, device
     )
 
+    epoch_elapsed = time.time() - epoch_start_time
+    epoch_durations.append(epoch_elapsed)
 
-# =========================
-# Save Final Model
-# =========================
-torch.save(
-    model.state_dict(),
-    "checkpoints/fpn_monuseg_final.pth"
-)
+    # Save to CSV log file immediately
+    with open(log_csv_path, mode="a", newline="") as f:
+      writer = csv.writer(f)
+      writer.writerow([
+          epoch,
+          f"{train_loss:.6f}",
+          f"{val_loss:.6f}",
+          f"{val_dice:.6f}",
+          f"{val_iou:.6f}",
+          f"{val_acc:.6f}",
+          f"{val_prec:.6f}",
+          f"{val_rec:.6f}",
+          f"{val_f1:.6f}",
+          f"{current_lr:.8f}",
+          f"{epoch_elapsed:.2f}",
+      ])
 
+    print(
+        f"Epoch [{epoch:03d}/{args.epochs:03d}] ({epoch_elapsed:.1f}s) | "
+        f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+        f"Val Dice: {val_dice:.4f} | IoU: {val_iou:.4f} | Acc: {val_acc:.4f}"
+    )
 
-# =========================
-# Plot Loss Curve
-# =========================
-plt.figure(figsize=(10, 5))
-plt.plot(train_history, label="Train Loss")
-plt.plot(test_history, label="Test Loss")
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Training vs Test Loss")
-plt.legend()
-plt.savefig("Results/loss_curve.png")
-plt.close()
+    # Always save latest model checkpoint
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_dice": val_dice,
+        },
+        last_checkpoint,
+    )
 
+    # Save best checkpoint whenever validation dice improves
+    if val_dice > best_val_dice:
+      best_val_dice = val_dice
+      torch.save(model.state_dict(), best_checkpoint)
+      print(f"--> Saved Best Model Checkpoint (Val Dice: {best_val_dice:.4f})")
 
-# =========================
-# Plot Dice Curve
-# =========================
-plt.figure(figsize=(10, 5))
-plt.plot(dice_history, label="Dice Score")
-plt.xlabel("Epochs")
-plt.ylabel("Dice Score")
-plt.title("Dice Score vs Epochs")
-plt.legend()
-plt.savefig("Results/dice_curve.png")
-plt.close()
+  total_elapsed = time.time() - total_start_time
+  avg_epoch_time = sum(epoch_durations) / len(epoch_durations)
 
-
-# =========================
-# Confusion Matrix
-# =========================
-cm = confusion_matrix(y_true, y_pred)
-disp = ConfusionMatrixDisplay(
-    confusion_matrix=cm,
-    display_labels=["Background", "Nuclei"]
-)
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Pixel-level Confusion Matrix")
-plt.savefig("Results/confusion_matrix.png")
-plt.close()
-
-
-# =========================
-# Final Metrics
-# =========================
-precision = precision_score(y_true, y_pred)
-recall = recall_score(y_true, y_pred)
-f1 = f1_score(y_true, y_pred)
-accuracy = accuracy_score(y_true, y_pred)
-iou = jaccard_score(y_true, y_pred)
-auc = roc_auc_score(y_true, y_prob)
+  print(f"\n==================== Training Summary ====================")
+  print(f"Total Training Time:    {total_elapsed/60:.2f} mins ({total_elapsed:.1f}s)")
+  print(f"Average Time / Epoch:   {avg_epoch_time:.2f}s")
+  print(f"Best Validation Dice:   {best_val_dice:.4f}")
+  print(f"Metrics Logged to:      {log_csv_path}")
+  print(f"Best Checkpoint:        {best_checkpoint}")
+  print(f"==========================================================\n")
 
 
-# =========================
-# Print Final Metrics
-# =========================
-print("\n" + "=" * 40)
-print(" FINAL EVALUATION METRICS ")
-print("=" * 40)
-print(f"Accuracy     : {accuracy:.4f}")
-print(f"Precision    : {precision:.4f}")
-print(f"Recall       : {recall:.4f}")
-print(f"F1-Score     : {f1:.4f}")
-print(f"Dice Score   : {avg_dice:.4f}")
-print(f"IoU          : {iou:.4f}")
-print(f"AUC          : {auc:.4f}")
-print("=" * 40)
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--train-img-dir", required=True)
+  parser.add_argument("--train-mask-dir", required=True)
+  parser.add_argument(
+      "--backbone",
+      default="resnet50",
+      choices=[
+          "resnet18",
+          "resnet34",
+          "resnet50",
+          "mobilenet_v2",
+          "efficientnet_b0",
+          "densenet121",
+      ],
+  )
+  parser.add_argument("--pretrained-weights", type=str, default=None)
+  parser.add_argument("--lr", type=float, default=3e-4)
+  parser.add_argument("--batch-size", type=int, default=2)
+  parser.add_argument("--accumulation-steps", type=int, default=2)
+  parser.add_argument("--weight-decay", type=float, default=0.0)
+  parser.add_argument("--epochs", type=int, default=60)
+  parser.add_argument("--target-size", type=int, nargs=2, default=[512, 512])
+  parser.add_argument("--augment", action="store_true")
+  parser.add_argument("--augment-prob", type=float, default=0.5)
+  parser.add_argument("--augment-factor", type=int, default=2)
+  parser.add_argument(
+      "--rotation-range", type=float, nargs=2, default=[-15, 15]
+  )
+  parser.add_argument("--scale-range", type=float, nargs=2, default=[0.9, 1.1])
+  parser.add_argument("--num-classes", type=int, default=1)
+  parser.add_argument("--pretrained", action="store_true")
+  parser.add_argument("--num-workers", type=int, default=4)
+  parser.add_argument("--save-dir", default="checkpoints/final")
 
-print("\nTraining Complete!")
-print("Saved Files:")
-print("1. Results/loss_curve.png")
-print("2. Results/dice_curve.png")
-print("3. Results/confusion_matrix.png")
-print("4. checkpoints/")
+  train(parser.parse_args())

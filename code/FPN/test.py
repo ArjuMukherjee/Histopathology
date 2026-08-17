@@ -1,150 +1,86 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import random
-import openslide
+import argparse
 import os
-from DWTFusion import DWTEntropyFusion
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, jaccard_score, roc_auc_score
 
-# -------- Seed Setter --------
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+from seg_head import SegModel
+from dataset import MoNuSegDataset, list_image_files
+from loss import total_loss
 
-# -------- Random Seed --------
-def set_random_seed():
-    seed = random.randint(0, 10000)
-    set_seed(seed)
-    print(f"Using random seed: {seed}")
-    return seed
 
-# -------- Model Initialization --------
-def init_model():
-    conv_layer1 = nn.Conv2d(3, 9, 1)
-    conv_layer2 = nn.Conv2d(9, 3, 1)
-    fusion = DWTEntropyFusion(9, 3)
-    return conv_layer1, conv_layer2, fusion
+def dice_score(preds, targets, smooth=1e-6):
+    preds = preds.astype(np.float32)
+    targets = targets.astype(np.float32)
+    intersection = np.sum(preds * targets)
+    return (2.0 * intersection + smooth) / (np.sum(preds) + np.sum(targets) + smooth)
 
-# -------- DWT FUNCTION --------
-def dwt(x):
-    ll = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device=x.device)
-    lh = torch.tensor([[-0.5, -0.5], [0.5, 0.5]], device=x.device)
-    hl = torch.tensor([[-0.5, 0.5], [-0.5, 0.5]], device=x.device)
-    hh = torch.tensor([[0.5, -0.5], [-0.5, 0.5]], device=x.device)
 
-    filters = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)
+def evaluate_test_set(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    test_files = list_image_files(args.test_img_dir)
+    test_ds = MoNuSegDataset(args.test_img_dir, args.test_mask_dir, target_size=args.target_size, augment=False, image_list=test_files)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    B, C, H, W = x.shape
-    filters = filters.repeat(C, 1, 1, 1)
+    model = SegModel(backbone_name=args.backbone, pretrained=False).to(device)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.eval()
 
-    x = x.view(1, B*C, H, W)
-    out = F.conv2d(x, filters, stride=2, groups=B*C)
-    out = out.view(B, C, 4, H//2, W//2)
+    all_preds, all_masks, all_probs = [], [], []
+    dice_list = []
+    running_loss = 0.0
 
-    return out[:, :, 1], out[:, :, 2], out[:, :, 3]
+    print(f"Evaluating {len(test_files)} test images using checkpoint: {args.checkpoint}")
 
-# -------- Load Slide --------
-slide = openslide.OpenSlide("../slide.svs")
+    with torch.no_grad():
+        for imgs, masks in test_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            preds = model(imgs)
+            loss = total_loss(preds, masks)
+            running_loss += loss.item()
 
-# -------- White Patch Filter --------
-def is_not_white(patch, threshold=0.8):
-    gray = np.mean(patch / 255.0)
-    return gray < threshold
+            probs = torch.sigmoid(preds)
+            pred_bin = (probs > 0.5).float().cpu().numpy()
+            mask_np = masks.cpu().numpy()
 
-# -------- Patch Extraction --------
-def get_random_patch():
-    W, H = slide.dimensions
+            dice_list.append(dice_score(pred_bin, mask_np))
+            all_probs.append(probs.cpu().numpy().flatten())
+            all_preds.append(pred_bin.astype(np.uint8).flatten())
+            all_masks.append(mask_np.astype(np.uint8).flatten())
 
-    while True:
-        x = random.randint(0, W - 512)
-        y = random.randint(0, H - 512)
+    all_masks = np.concatenate(all_masks)
+    all_preds = np.concatenate(all_preds)
+    all_probs = np.concatenate(all_probs)
 
-        patch = slide.read_region((x, y), 0, (512, 512)).convert("RGB")
-        patch_np = np.array(patch)
+    precision = precision_score(all_masks, all_preds, zero_division=0)
+    recall = recall_score(all_masks, all_preds, zero_division=0)
+    f1 = f1_score(all_masks, all_preds, zero_division=0)
+    acc = accuracy_score(all_masks, all_preds)
+    iou = jaccard_score(all_masks, all_preds, zero_division=0)
+    auc = roc_auc_score(all_masks, all_probs)
+    mean_dice = np.mean(dice_list)
 
-        if is_not_white(patch_np):
-            return patch_np
+    print("\n================== TEST SET EVALUATION RESULTS ==================")
+    print(f"Mean Dice Score : {mean_dice:.4f}")
+    print(f"Mean IoU (Jaccard): {iou:.4f}")
+    print(f"F1-Score         : {f1:.4f}")
+    print(f"Precision        : {precision:.4f}")
+    print(f"Recall           : {recall:.4f}")
+    print(f"Accuracy         : {acc:.4f}")
+    print(f"AUC-ROC          : {auc:.4f}")
+    print(f"Mean Loss        : {running_loss / len(test_loader):.4f}")
+    print("=================================================================\n")
 
-# -------- Forward Pass --------
-def run_model_on_patch(patch, conv_layer1, conv_layer2, fusion):
-    img = torch.tensor(patch / 255.0, dtype=torch.float32)
-    img = img.permute(2, 0, 1).unsqueeze(0)
 
-    C = conv_layer1(img)
-    P = conv_layer2(C)
-
-    LH, HL, HH = dwt(C)
-    fusion_out = F.interpolate(
-        fusion(LH, HL, HH),
-        size=(512, 512),
-        mode='bilinear'
-    )
-
-    # P_final = torch.sigmoid(P + fusion_out)
-    P_final = P + fusion_out
-
-    out = P_final[0].detach().permute(1, 2, 0).numpy()
-    out = np.clip(out, 0, 1)
-
-    return out, P, P_final, img
-
-# -------- Main Execution --------
 if __name__ == "__main__":
-
-    num_results = 10
-
-    # Create output folder
-    save_dir = "outputs"
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Set random seed
-    set_seed(999)
-
-    # 🔥 Initialize model AFTER seed
-    conv_layer1, conv_layer2, fusion = init_model()
-
-    # -------- Run --------
-    for run in range(num_results):
-
-        plt.figure(figsize=(12, 12))
-
-        for i in range(3):
-            patch = get_random_patch()
-
-            out, P, P_final, img = run_model_on_patch(
-                patch, conv_layer1, conv_layer2, fusion
-            )
-
-            original = img[0].permute(1, 2, 0).numpy()
-            p_out = np.clip(P[0].detach().permute(1, 2, 0).numpy(), 0, 1)
-            p_final_out = np.clip(P_final[0].detach().permute(1, 2, 0).numpy(), 0, 1)
-            # p_out = P[0].detach().permute(1, 2, 0).numpy()
-            # p_final_out = P_final[0].detach().permute(1, 2, 0).numpy()
-            # p_final_out = (p_final_out - p_final_out.min()) / (p_final_out.max() - p_final_out.min() + 1e-8)
-
-            # -------- Plot --------
-            plt.subplot(3, 3, 3*i + 1)
-            plt.imshow(original)
-            plt.title(f"Patch {i+1} - Original")
-            plt.axis('off')
-
-            plt.subplot(3, 3, 3*i + 2)
-            plt.imshow(p_out)
-            plt.title(f"Patch {i+1} - P")
-            plt.axis('off')
-
-            plt.subplot(3, 3, 3*i + 3)
-            plt.imshow(p_final_out)
-            plt.title(f"Patch {i+1} - P_final")
-            plt.axis('off')
-
-        plt.tight_layout()
-
-        save_path = os.path.join(save_dir, f"result_{run+1}.png")
-        plt.savefig(save_path)
-        plt.close()
-
-    print(f"Saved {num_results} figures in 'outputs' folder")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test-img-dir", default="code/MonuSeg/MonuSeg/Test/TissueImages")
+    parser.add_argument("--test-mask-dir", default="code/MonuSeg/MonuSeg/Test/GroundTruth")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--backbone", default="resnet50")
+    parser.add_argument("--target-size", type=int, nargs=2, default=[512, 512])
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4)
+    evaluate_test_set(parser.parse_args())

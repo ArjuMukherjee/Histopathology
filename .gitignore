@@ -1,5 +1,28 @@
+# Datasets and Large Files
+data/
+WSI_Patches/
+MonuSeg/
+**/MonuSeg/
+
+# Heavy Model Weights & Pretrained Checkpoints
 checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# Output & Result Directories (matches root and nested paths)
+output/
+outputs/
+Results/
+results/
+**/output/
+**/outputs/
+
+# Cloned External Repositories
 detectron2/
+
+# Sensitive Information
+SECRETS/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
