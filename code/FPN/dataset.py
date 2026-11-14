@@ -120,14 +120,19 @@ class MoNuSegDataset(Dataset):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         base_name = os.path.splitext(img_name)[0]
-        mask_name = f"{base_name}_bin_mask.png"
-        mask_path = os.path.join(self.mask_dir, mask_name)
-        mask = cv2.imread(mask_path, 0)
-        if mask is None:
-            mask_path = os.path.join(self.mask_dir, f"{base_name}.png")
+        mask_candidates = (
+            f"{base_name}_bin_mask.png",
+            f"{base_name}.png",
+            f"{base_name} .png",
+        )
+        mask = None
+        for mask_name in mask_candidates:
+            mask_path = os.path.join(self.mask_dir, mask_name)
             mask = cv2.imread(mask_path, 0)
-            if mask is None:
-                raise FileNotFoundError(f"Could not find mask for {img_name} at {self.mask_dir}")
+            if mask is not None:
+                break
+        if mask is None:
+            raise FileNotFoundError(f"Could not find mask for {img_name} at {self.mask_dir}")
 
         img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
