@@ -89,21 +89,26 @@ class MoNuSegDataset(Dataset):
         scale = np.random.uniform(self.scale_range[0], self.scale_range[1])
         h, w = img.shape[:2]
         center = (w / 2.0, h / 2.0)
+
+        # Zoom in enough so the rotated image still covers the full canvas
+        # (no border extrapolation needed; avoids mirror seams / black wedges)
+        rad = np.deg2rad(abs(angle))
+        cover_scale = np.cos(rad) + np.sin(rad)
+        scale = max(scale, cover_scale)
+
         matrix = cv2.getRotationMatrix2D(center, angle, scale)
 
         img = cv2.warpAffine(
             img,
             matrix,
             (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101
+            flags=cv2.INTER_LINEAR
         )
         mask = cv2.warpAffine(
             mask,
             matrix,
             (w, h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_REFLECT_101
+            flags=cv2.INTER_NEAREST
         )
         return img, mask
 
