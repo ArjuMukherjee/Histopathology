@@ -103,8 +103,7 @@ class MoNuSegDataset(Dataset):
             matrix,
             (w, h),
             flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
+            borderMode=cv2.BORDER_REFLECT_101
         )
         return img, mask
 
