@@ -132,9 +132,10 @@ class MoNuSegDataset(Dataset):
         mask = None
         for mask_name in mask_candidates:
             mask_path = os.path.join(self.mask_dir, mask_name)
-            mask = cv2.imread(mask_path, 0)
-            if mask is not None:
-                break
+            if os.path.exists(mask_path):
+                mask = cv2.imread(mask_path, 0)
+                if mask is not None:
+                    break
         if mask is None:
             raise FileNotFoundError(f"Could not find mask for {img_name} at {self.mask_dir}")
 
