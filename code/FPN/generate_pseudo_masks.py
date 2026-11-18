@@ -25,7 +25,9 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=120, min_radius=4, max_rad
     cluster_prob = 0.7 - 0.4 * d            # low d -> mostly clustered
     spread_lo, spread_hi = 10 + 30 * d, 40 + 90 * d  # low d -> tight clusters
 
-    for _ in range(num_nuclei):
+    actual_nuclei = num_nuclei + np.random.randint(-15, 16)  # vary count +-15
+
+    for _ in range(actual_nuclei):
         # random per-nucleus separation: gaps and closeness both occur
         base_sep = max_radius * (0.4 + 1.6 * d)          # 0 -> overlap allowed, 1 -> wide gaps
         min_sep = base_sep * np.random.uniform(0.5, 1.5)  # random gaps / random closeness
