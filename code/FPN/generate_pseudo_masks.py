@@ -4,8 +4,8 @@ import numpy as np
 import argparse
 
 
-def generate_polygon_mask(size=(512, 512), num_nuclei=120, min_radius=4, max_radius=10,
-                          num_vertices=16, distributiveness=0.6):
+def generate_polygon_mask(size=(512, 512), num_nuclei=100, min_radius=4, max_radius=9,
+                          num_vertices=16, distributiveness=0.33):
     """distributiveness in [0, 1]:
     0.0 -> tight clumps, nuclei may touch/overlap, strong clustering
     1.0 -> evenly spread, well-separated nuclei
