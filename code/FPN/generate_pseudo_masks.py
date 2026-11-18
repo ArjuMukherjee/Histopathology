@@ -4,26 +4,52 @@ import numpy as np
 import argparse
 
 
-def generate_polygon_mask(size=(512, 512), num_nuclei=120, min_radius=6, max_radius=16, num_vertices=8):
+def generate_polygon_mask(size=(512, 512), num_nuclei=120, min_radius=4, max_radius=10,
+                          num_vertices=16, distributiveness=0.6):
+    """distributiveness in [0, 1]:
+    0.0 -> tight clumps, nuclei may touch/overlap, strong clustering
+    1.0 -> evenly spread, well-separated nuclei
+    """
     mask = np.zeros(size, dtype=np.uint8)
     h, w = size
+    d = float(np.clip(distributiveness, 0.0, 1.0))
 
-    # Random glandular clusters
+    # Random glandular clusters (centers may sit near the edges too)
     num_glands = np.random.randint(2, 5)
-    gland_centers = np.random.randint(50, size[0] - 50, size=(num_glands, 2))
+    gland_centers = np.column_stack([
+        np.random.randint(0, w, num_glands),
+        np.random.randint(0, h, num_glands),
+    ])
+
+    placed_centers = []
+    cluster_prob = 0.7 - 0.4 * d            # low d -> mostly clustered
+    spread_lo, spread_hi = 10 + 30 * d, 40 + 90 * d  # low d -> tight clusters
 
     for _ in range(num_nuclei):
-        if np.random.rand() < 0.6 and len(gland_centers) > 0:
-            g_center = gland_centers[np.random.randint(0, num_glands)]
-            angle = np.random.uniform(0, 2 * np.pi)
-            r_dist = np.random.uniform(20, 60)
-            cx = int(np.clip(g_center[0] + r_dist * np.cos(angle), 20, w - 20))
-            cy = int(np.clip(g_center[1] + r_dist * np.sin(angle), 20, h - 20))
-        else:
-            cx = np.random.randint(20, w - 20)
-            cy = np.random.randint(20, h - 20)
+        # random per-nucleus separation: gaps and closeness both occur
+        base_sep = max_radius * (0.4 + 1.6 * d)          # 0 -> overlap allowed, 1 -> wide gaps
+        min_sep = base_sep * np.random.uniform(0.5, 1.5)  # random gaps / random closeness
 
-        # Polygon vertices with Bézier-like jitter
+        cx, cy = None, None
+        for _attempt in range(10):
+            if np.random.rand() < cluster_prob and len(gland_centers) > 0:
+                g_center = gland_centers[np.random.randint(0, num_glands)]
+                angle = np.random.uniform(0, 2 * np.pi)
+                r_dist = np.random.uniform(spread_lo, spread_hi)
+                tx = int(np.clip(g_center[0] + r_dist * np.cos(angle), 0, w - 1))
+                ty = int(np.clip(g_center[1] + r_dist * np.sin(angle), 0, h - 1))
+            else:
+                tx = np.random.randint(0, w)
+                ty = np.random.randint(0, h)
+
+            if all((tx - px) ** 2 + (ty - py) ** 2 >= min_sep ** 2 for px, py in placed_centers):
+                cx, cy = tx, ty
+                break
+        if cx is None:
+            continue  # couldn't find a spot respecting this nucleus' separation; skip
+        placed_centers.append((cx, cy))
+
+        # Jittered vertices -> convex hull (nuclei are convex; clipped at borders -> partial nuclei at edges)
         angles = np.sort(np.random.uniform(0, 2 * np.pi, num_vertices))
         radii = np.random.uniform(min_radius, max_radius, num_vertices)
         pts = []
@@ -32,7 +58,8 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=120, min_radius=6, max_rad
             py = int(cy + r * np.sin(a))
             pts.append([px, py])
 
-        cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 255)
+        hull = cv2.convexHull(np.array(pts, dtype=np.int32))
+        cv2.fillPoly(mask, [hull], 255)
 
     return mask
 
