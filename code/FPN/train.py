@@ -32,7 +32,8 @@ def set_bn_eval(m):
   if "BatchNorm" in classname:
     m.eval()
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, loss_kwargs=None):
+  loss_kwargs = loss_kwargs or {}
   model.eval()
   running_loss = 0.0
   all_preds_bin = []
@@ -43,7 +44,7 @@ def evaluate(model, loader, device):
     for imgs, masks in loader:
       imgs, masks = imgs.to(device), masks.to(device)
       preds = model(imgs)
-      loss = total_loss(preds, masks)
+      loss = total_loss(preds, masks, **loss_kwargs)
       running_loss += loss.item()
 
       probs = torch.sigmoid(preds)
@@ -72,6 +73,9 @@ def evaluate(model, loader, device):
 def train(args):
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   os.makedirs(args.save_dir, exist_ok=True)
+  loss_kwargs = dict(mode=args.loss_mode, bce_weight=args.loss_bce_weight,
+                     dice_weight=args.loss_dice_weight, min_bce_weight=args.loss_min_bce_weight,
+                     max_bce_weight=args.loss_max_bce_weight, sharpness=args.loss_sharpness)
 
   all_files = list_image_files(args.train_img_dir)
   train_files, val_files, _ = split_image_list(
@@ -181,7 +185,7 @@ def train(args):
     for i, (imgs, masks) in enumerate(train_loader):
       imgs, masks = imgs.to(device), masks.to(device)
       preds = model(imgs)
-      loss = total_loss(preds, masks) / args.accumulation_steps
+      loss = total_loss(preds, masks, **loss_kwargs) / args.accumulation_steps
       loss.backward()
 
       if (i + 1) % args.accumulation_steps == 0 or (i + 1) == len(train_loader):
@@ -196,7 +200,7 @@ def train(args):
 
     train_loss = running_loss / len(train_loader)
     val_loss, val_dice, val_iou, val_acc, val_prec, val_rec, val_f1 = evaluate(
-        model, val_loader, device
+        model, val_loader, device, loss_kwargs
     )
 
     epoch_elapsed = time.time() - epoch_start_time
@@ -288,5 +292,11 @@ if __name__ == "__main__":
   parser.add_argument("--pretrained", action="store_true")
   parser.add_argument("--num-workers", type=int, default=4)
   parser.add_argument("--save-dir", default="checkpoints/final")
+  parser.add_argument("--loss-mode", choices=["sum", "normalized", "adaptive"], default="adaptive")
+  parser.add_argument("--loss-bce-weight", type=float, default=0.5)
+  parser.add_argument("--loss-dice-weight", type=float, default=0.5)
+  parser.add_argument("--loss-min-bce-weight", type=float, default=0.2)
+  parser.add_argument("--loss-max-bce-weight", type=float, default=0.8)
+  parser.add_argument("--loss-sharpness", type=float, default=2.0)
 
   train(parser.parse_args())

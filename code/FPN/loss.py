@@ -11,9 +11,36 @@ def dice_loss(pred, target, smooth=1.0):
     return 1.0 - ((2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth))
 
 
-def total_loss(pred, target):
-    """Downstream Supervised Fine-Tuning Loss."""
-    return bce_loss(pred, target) + dice_loss(pred, target)
+def total_loss(pred, target, mode="adaptive", bce_weight=0.5, dice_weight=0.5,
+               min_bce_weight=0.2, max_bce_weight=0.8, sharpness=2.0, return_parts=False):
+    """Downstream Supervised Fine-Tuning Loss. `mode` selects the formulation (for ablation):
+
+    "sum"        : bce_weight * BCE + dice_weight * Dice            (original; unbounded)
+    "normalized" : bce_weight * (1 - exp(-BCE)) + dice_weight * Dice (both terms in [0,1]; fixed weights)
+    "adaptive"   : w * (1 - exp(-BCE)) + (1 - w) * Dice, where
+                   w = clamp(1 - exp(-sharpness * BCE.detach()), min_bce_weight, max_bce_weight)
+                   -> BCE dominates early (high BCE), Dice dominates late (low BCE)
+
+    return_parts=True also returns a dict of detached components for logging.
+    """
+    bce = bce_loss(pred, target)
+    dice = dice_loss(pred, target)
+
+    if mode == "sum":
+        w_bce, w_dice, bce_term = bce_weight, dice_weight, bce
+    elif mode == "normalized":
+        w_bce, w_dice, bce_term = bce_weight, dice_weight, 1.0 - torch.exp(-bce)
+    elif mode == "adaptive":
+        w_bce = torch.clamp(1.0 - torch.exp(-sharpness * bce.detach()), min_bce_weight, max_bce_weight)
+        w_dice, bce_term = 1.0 - w_bce, 1.0 - torch.exp(-bce)
+    else:
+        raise ValueError(f"Unknown loss mode '{mode}'. Use 'sum', 'normalized' or 'adaptive'.")
+
+    total = w_bce * bce_term + w_dice * dice
+    if return_parts:
+        return total, {"bce": bce.item(), "dice_loss": dice.item(),
+                       "w_bce": float(w_bce), "w_dice": float(w_dice)}
+    return total
 
 
 class UNITPathSSLLoss(nn.Module):
