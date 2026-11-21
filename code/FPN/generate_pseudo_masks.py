@@ -4,15 +4,23 @@ import numpy as np
 import argparse
 
 
-def generate_polygon_mask(size=(512, 512), num_nuclei=100, min_radius=4, max_radius=9,
-                          num_vertices=16, distributiveness=0.33):
+def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_radius=9,
+                          num_vertices=16, distributiveness=0.33, nuclei_range=(15, 115),
+                          oblong_prob=0.7, elongation_range=(1.4, 2.6), boundary_px=1):
     """distributiveness in [0, 1]:
-    0.0 -> tight clumps, nuclei may touch/overlap, strong clustering
+    0.0 -> tight clumps, nuclei may touch, strong clustering
     1.0 -> evenly spread, well-separated nuclei
+    num_nuclei=None -> count drawn uniformly from nuclei_range (default 15..115).
+    oblong_prob      -> fraction of nuclei drawn as randomly oriented ellipses (axis ratio from elongation_range).
+    boundary_px      -> every nucleus is separated from its neighbours by at least this many background pixels,
+                        like the clear inter-nuclear boundary in real MoNuSeg masks (no merged blobs).
     """
-    mask = np.zeros(size, dtype=np.uint8)
     h, w = size
     d = float(np.clip(distributiveness, 0.0, 1.0))
+    if num_nuclei is None:
+        actual_nuclei = int(np.random.randint(nuclei_range[0], nuclei_range[1] + 1))
+    else:
+        actual_nuclei = int(num_nuclei)
 
     # Random glandular clusters (centers may sit near the edges too)
     num_glands = np.random.randint(2, 5)
@@ -25,12 +33,13 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=100, min_radius=4, max_rad
     cluster_prob = 0.7 - 0.4 * d            # low d -> mostly clustered
     spread_lo, spread_hi = 10 + 30 * d, 40 + 90 * d  # low d -> tight clusters
 
-    actual_nuclei = num_nuclei + np.random.randint(-15, 16)  # vary count +-15
+    mask = np.zeros(size, dtype=np.uint8)
+    occupied = np.zeros(size, dtype=np.uint8)    # mask dilated by boundary_px: the 'no-go' zone for new nuclei
+    ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * boundary_px + 1, 2 * boundary_px + 1))
 
     for _ in range(actual_nuclei):
-        # random per-nucleus separation: gaps and closeness both occur
-        base_sep = max_radius * (0.4 + 1.6 * d)          # 0 -> overlap allowed, 1 -> wide gaps
-        min_sep = base_sep * np.random.uniform(0.5, 1.5)  # random gaps / random closeness
+        base_sep = max_radius * (0.4 + 1.6 * d)
+        min_sep = base_sep * np.random.uniform(0.5, 1.5)
 
         cx, cy = None, None
         for _attempt in range(10):
@@ -43,25 +52,40 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=100, min_radius=4, max_rad
             else:
                 tx = np.random.randint(0, w)
                 ty = np.random.randint(0, h)
-
             if all((tx - px) ** 2 + (ty - py) ** 2 >= min_sep ** 2 for px, py in placed_centers):
                 cx, cy = tx, ty
                 break
         if cx is None:
-            continue  # couldn't find a spot respecting this nucleus' separation; skip
+            continue
         placed_centers.append((cx, cy))
 
-        # Jittered vertices -> convex hull (nuclei are convex; clipped at borders -> partial nuclei at edges)
+        # Shape: oblong (ellipse, random orientation) with prob oblong_prob, otherwise roundish.
         angles = np.sort(np.random.uniform(0, 2 * np.pi, num_vertices))
-        radii = np.random.uniform(min_radius, max_radius, num_vertices)
-        pts = []
-        for a, r in zip(angles, radii):
-            px = int(cx + r * np.cos(a))
-            py = int(cy + r * np.sin(a))
-            pts.append([px, py])
+        if np.random.rand() < oblong_prob:
+            elong = np.random.uniform(*elongation_range)
+            a_ax = np.random.uniform(min_radius, max_radius) * np.sqrt(elong)   # semi-major
+            b_ax = a_ax / elong                                                 # semi-minor
+            jit = np.random.uniform(0.85, 1.15, num_vertices)
+            theta = np.random.uniform(0, np.pi)
+            ex, ey = a_ax * np.cos(angles) * jit, b_ax * np.sin(angles) * jit
+            xs = cx + ex * np.cos(theta) - ey * np.sin(theta)
+            ys = cy + ex * np.sin(theta) + ey * np.cos(theta)
+        else:
+            radii = np.random.uniform(min_radius, max_radius, num_vertices)
+            xs, ys = cx + radii * np.cos(angles), cy + radii * np.sin(angles)
+        pts = np.stack([xs, ys], 1).round().astype(np.int32)
+        hull = cv2.convexHull(pts)
 
-        hull = cv2.convexHull(np.array(pts, dtype=np.int32))
-        cv2.fillPoly(mask, [hull], 255)
+        # Draw the nucleus, then erase any pixel that falls inside an existing nucleus' boundary ring,
+        # so neighbouring nuclei never merge: there is always >= boundary_px of background between them.
+        nuc = np.zeros(size, dtype=np.uint8)
+        cv2.fillPoly(nuc, [hull], 255)
+        nuc[occupied > 0] = 0
+        if cv2.countNonZero(nuc) < 6:      # almost fully carved away -> drop it
+            placed_centers.pop()
+            continue
+        mask |= nuc
+        occupied |= cv2.dilate(nuc, ring_k)
 
     return mask
 
