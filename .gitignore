@@ -247,3 +247,6 @@ __marimo__/
 .pip_temp/
 .vscode/
 DWT/
+
+# Visual Studio
+.vs/
