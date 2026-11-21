@@ -5,7 +5,7 @@ import argparse
 
 
 def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_radius=9,
-                          num_vertices=16, distributiveness=0.33, nuclei_range=(15, 115),
+                          num_vertices=48, distributiveness=0.33, nuclei_range=(15, 115),
                           oblong_prob=0.7, elongation_range=(1.4, 2.6), boundary_px=1):
     """distributiveness in [0, 1]:
     0.0 -> tight clumps, nuclei may touch, strong clustering
@@ -59,27 +59,28 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_ra
             continue
         placed_centers.append((cx, cy))
 
-        # Shape: oblong (ellipse, random orientation) with prob oblong_prob, otherwise roundish.
-        angles = np.sort(np.random.uniform(0, 2 * np.pi, num_vertices))
+        # Shape: ellipse (oblong with prob oblong_prob, otherwise near-circular) whose radius is modulated by
+        # 2-3 low-frequency harmonics -> smooth, gently curved, slightly asymmetric outline like a real nucleus.
         if np.random.rand() < oblong_prob:
             elong = np.random.uniform(*elongation_range)
-            a_ax = np.random.uniform(min_radius, max_radius) * np.sqrt(elong)   # semi-major
-            b_ax = a_ax / elong                                                 # semi-minor
-            jit = np.random.uniform(0.85, 1.15, num_vertices)
-            theta = np.random.uniform(0, np.pi)
-            ex, ey = a_ax * np.cos(angles) * jit, b_ax * np.sin(angles) * jit
-            xs = cx + ex * np.cos(theta) - ey * np.sin(theta)
-            ys = cy + ex * np.sin(theta) + ey * np.cos(theta)
         else:
-            radii = np.random.uniform(min_radius, max_radius, num_vertices)
-            xs, ys = cx + radii * np.cos(angles), cy + radii * np.sin(angles)
+            elong = np.random.uniform(1.0, 1.25)
+        a_ax = np.random.uniform(min_radius, max_radius) * np.sqrt(elong)   # semi-major
+        b_ax = a_ax / elong                                                 # semi-minor
+        theta = np.random.uniform(0, np.pi)
+        t = np.linspace(0, 2 * np.pi, num_vertices, endpoint=False)
+        r_mod = np.ones_like(t)
+        for k in (2, 3):                                        # only low harmonics: no wiggles / jaggies
+            r_mod += np.random.uniform(0.0, 0.06) * np.cos(k * t + np.random.uniform(0, 2 * np.pi))
+        ex, ey = a_ax * np.cos(t) * r_mod, b_ax * np.sin(t) * r_mod
+        xs = cx + ex * np.cos(theta) - ey * np.sin(theta)
+        ys = cy + ex * np.sin(theta) + ey * np.cos(theta)
         pts = np.stack([xs, ys], 1).round().astype(np.int32)
-        hull = cv2.convexHull(pts)
 
         # Draw the nucleus, then erase any pixel that falls inside an existing nucleus' boundary ring,
         # so neighbouring nuclei never merge: there is always >= boundary_px of background between them.
         nuc = np.zeros(size, dtype=np.uint8)
-        cv2.fillPoly(nuc, [hull], 255)
+        cv2.fillPoly(nuc, [pts], 255)
         nuc[occupied > 0] = 0
         if cv2.countNonZero(nuc) < 6:      # almost fully carved away -> drop it
             placed_centers.pop()
