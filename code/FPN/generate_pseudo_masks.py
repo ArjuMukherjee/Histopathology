@@ -36,12 +36,9 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_ra
     mask = np.zeros(size, dtype=np.uint8)
     occupied = np.zeros(size, dtype=np.uint8)    # mask dilated by boundary_px: the 'no-go' zone for new nuclei
     ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * boundary_px + 1, 2 * boundary_px + 1))
+    t = np.linspace(0, 2 * np.pi, num_vertices, endpoint=False)
 
-    for _ in range(actual_nuclei):
-        base_sep = max_radius * (0.4 + 1.6 * d)
-        min_sep = base_sep * np.random.uniform(0.5, 1.5)
-
-        cx, cy = None, None
+    def sample_center(min_sep):
         for _attempt in range(10):
             if np.random.rand() < cluster_prob and len(gland_centers) > 0:
                 g_center = gland_centers[np.random.randint(0, num_glands)]
@@ -53,11 +50,19 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_ra
                 tx = np.random.randint(0, w)
                 ty = np.random.randint(0, h)
             if all((tx - px) ** 2 + (ty - py) ** 2 >= min_sep ** 2 for px, py in placed_centers):
-                cx, cy = tx, ty
-                break
-        if cx is None:
-            continue
-        placed_centers.append((cx, cy))
+                return tx, ty
+        return None
+
+    def nucleus_outline(cx, cy, a_ax, b_ax, theta, r_mod):
+        # Smooth closed contour: ellipse radius modulated by low harmonics only (always convex-looking)
+        ex, ey = a_ax * np.cos(t) * r_mod, b_ax * np.sin(t) * r_mod
+        xs = cx + ex * np.cos(theta) - ey * np.sin(theta)
+        ys = cy + ex * np.sin(theta) + ey * np.cos(theta)
+        return np.stack([xs, ys], 1).round().astype(np.int32)
+
+    for _ in range(actual_nuclei):
+        base_sep = max_radius * (0.4 + 1.6 * d)
+        min_sep = base_sep * np.random.uniform(0.5, 1.5)
 
         # Shape: ellipse (oblong with prob oblong_prob, otherwise near-circular) whose radius is modulated by
         # 2-3 low-frequency harmonics -> smooth, gently curved, slightly asymmetric outline like a real nucleus.
@@ -68,25 +73,32 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_ra
         a_ax = np.random.uniform(min_radius, max_radius) * np.sqrt(elong)   # semi-major
         b_ax = a_ax / elong                                                 # semi-minor
         theta = np.random.uniform(0, np.pi)
-        t = np.linspace(0, 2 * np.pi, num_vertices, endpoint=False)
         r_mod = np.ones_like(t)
         for k in (2, 3):                                        # only low harmonics: no wiggles / jaggies
             r_mod += np.random.uniform(0.0, 0.06) * np.cos(k * t + np.random.uniform(0, 2 * np.pi))
-        ex, ey = a_ax * np.cos(t) * r_mod, b_ax * np.sin(t) * r_mod
-        xs = cx + ex * np.cos(theta) - ey * np.sin(theta)
-        ys = cy + ex * np.sin(theta) + ey * np.cos(theta)
-        pts = np.stack([xs, ys], 1).round().astype(np.int32)
 
-        # Draw the nucleus, then erase any pixel that falls inside an existing nucleus' boundary ring,
-        # so neighbouring nuclei never merge: there is always >= boundary_px of background between them.
-        nuc = np.zeros(size, dtype=np.uint8)
-        cv2.fillPoly(nuc, [pts], 255)
-        nuc[occupied > 0] = 0
-        if cv2.countNonZero(nuc) < 6:      # almost fully carved away -> drop it
-            placed_centers.pop()
-            continue
-        mask |= nuc
-        occupied |= cv2.dilate(nuc, ring_k)
+        # Overlap handling: never carve a nucleus (that leaves sharp cusps as if one lay on top of another).
+        # Instead re-sample the position, shrinking the nucleus a little each time, until its WHOLE smooth
+        # outline fits outside every neighbour's boundary ring. All nuclei therefore lie in one plane with
+        # complete convex contours and >= boundary_px of background between them.
+        placed = False
+        shrink = 1.0
+        for _try in range(6):
+            c = sample_center(min_sep)
+            if c is None:
+                break
+            pts = nucleus_outline(c[0], c[1], a_ax * shrink, b_ax * shrink, theta, r_mod)
+            nuc = np.zeros(size, dtype=np.uint8)
+            cv2.fillPoly(nuc, [pts], 255)
+            if cv2.countNonZero(nuc) >= 6 and not np.any(nuc & occupied):
+                placed_centers.append(c)
+                mask |= nuc
+                occupied |= cv2.dilate(nuc, ring_k)
+                placed = True
+                break
+            shrink *= 0.9
+        if not placed:
+            continue   # no room for this nucleus; skip it
 
     return mask
 
