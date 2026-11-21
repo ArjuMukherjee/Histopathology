@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 bce_loss = nn.BCEWithLogitsLoss()
 
@@ -43,29 +44,74 @@ def total_loss(pred, target, mode="adaptive", bce_weight=0.5, dice_weight=0.5,
     return total
 
 
+def r1_penalty(d_out, real_in):
+    """R1 regularization: E[ ||grad_x D(x)||^2 ] on REAL samples. `real_in` must have requires_grad=True."""
+    grad, = torch.autograd.grad(outputs=d_out.sum(), inputs=real_in, create_graph=True)
+    return grad.pow(2).reshape(grad.shape[0], -1).sum(1).mean()
+
+
 class UNITPathSSLLoss(nn.Module):
     """
-    UNITPathSSL Multi-Task Pretraining Objective (Eq. 7):
-    L = L_GAN(G, DG) + lambda1 * L_GAN(S, DS) + lambda2 * L_cyc(G, S) + lambda3 * L_seg(S)
+    UNITPathSSL pretraining objective (paper Eq. 1-3, 7):
+        L = L_GAN(G, D_G) + lambda1 * L_GAN(S, D_S) + lambda2 * L_cyc(G, S) + lambda3 * L_seg(S)
+
+    Eq. 1  L_GAN(G, D_G): non-saturating logistic GAN + R1 (gamma_g) on real images y
+        D_G: -E[log D_G(y)] - E[log(1 - D_G(G(x)))] + gamma_g/2 * E[||grad D_G(y)||^2]
+        G  : -E[log D_G(G(x))]
+    Eq. 2  L_GAN(S, D_S): least-squares GAN + R1 (gamma_s) on real masks x
+        D_S: 1/2 E[(D_S(x) - 1)^2] + 1/2 E[D_S(S(y))^2] + gamma_s/2 * E[||grad D_S(x)||^2]
+        S  : 1/2 E[(D_S(S(y)) - 1)^2]                     <-- note: S applied to REAL tissue y
+    Eq. 3  L_cyc(G, S) = E[||S(G(x)) - x||_1] + E[||G(S(y)) - y||_1]   (both directions)
+
+    All D_* outputs are raw logits (PatchGAN maps).
     """
-    def __init__(self, lambda1=2.0, lambda2=10.0, lambda3=2.0):
+    def __init__(self, lambda1=2.0, lambda2=10.0, lambda3=2.0, gamma_g=10.0, gamma_s=10.0):
         super().__init__()
-        self.lambda1 = lambda1
-        self.lambda2 = lambda2
-        self.lambda3 = lambda3
+        self.lambda1, self.lambda2, self.lambda3 = lambda1, lambda2, lambda3
+        self.gamma_g, self.gamma_s = gamma_g, gamma_s
         self.l1_loss = nn.L1Loss()
 
-    def forward(self, d_s_pred_fake, x_rec, real_mask_x, seg_loss_dict=None):
-        # LSGAN Loss on Generator S
-        loss_adv_s = 0.5 * torch.mean((d_s_pred_fake - 1.0) ** 2)
+    # ---------------- Discriminator objectives ----------------
+    def d_g_loss(self, d_real_logits, d_fake_logits, real_y=None):
+        """Eq. 1 (D_G). Pass real_y (requires_grad) to include the R1 term."""
+        loss = F.softplus(-d_real_logits).mean() + F.softplus(d_fake_logits).mean()
+        r1 = torch.tensor(0.0, device=d_real_logits.device)
+        if real_y is not None and self.gamma_g > 0:
+            r1 = r1_penalty(d_real_logits, real_y)
+            loss = loss + 0.5 * self.gamma_g * r1
+        return loss, {"d_g_adv": loss.item(), "d_g_r1": r1.item()}
 
-        # L1 Cycle Consistency Loss
-        loss_cyc = self.l1_loss(x_rec, real_mask_x)
+    def d_s_loss(self, d_real_logits, d_fake_logits, real_x=None):
+        """Eq. 2 (D_S). Pass real_x (requires_grad) to include the R1 term."""
+        loss = 0.5 * ((d_real_logits - 1.0) ** 2).mean() + 0.5 * (d_fake_logits ** 2).mean()
+        r1 = torch.tensor(0.0, device=d_real_logits.device)
+        if real_x is not None and self.gamma_s > 0:
+            r1 = r1_penalty(d_real_logits, real_x)
+            loss = loss + 0.5 * self.gamma_s * r1
+        return loss, {"d_s_adv": loss.item(), "d_s_r1": r1.item()}
 
-        # Instance Segmentation Guided Loss
+    # ---------------- Generator (G + S) objective ----------------
+    def forward(self, d_g_fake_logits, d_s_fake_logits, x_rec, real_x, y_rec, real_y, seg_loss_dict=None):
+        """
+        d_g_fake_logits : D_G(G(x))            -> Eq. 1 generator term (weight 1)
+        d_s_fake_logits : D_S(S(y))            -> Eq. 2 generator term (lambda1)
+        x_rec, real_x   : S(G(x)) vs x         -> forward cycle (lambda2)
+        y_rec, real_y   : G(S(y)) vs y         -> backward cycle (lambda2)
+        seg_loss_dict   : ISG Mask R-CNN losses -> lambda3 (optional)
+        """
+        loss_adv_g = F.softplus(-d_g_fake_logits).mean()                 # -log sigmoid(D_G(G(x)))
+        loss_adv_s = 0.5 * ((d_s_fake_logits - 1.0) ** 2).mean()         # LSGAN on S
+        loss_cyc_x = self.l1_loss(x_rec, real_x)                          # X -> Y -> X
+        loss_cyc_y = self.l1_loss(y_rec, real_y)                          # Y -> X -> Y
+        loss_cyc = loss_cyc_x + loss_cyc_y
+
         loss_isg = torch.tensor(0.0, device=x_rec.device)
         if seg_loss_dict is not None:
             loss_isg = sum(loss for loss in seg_loss_dict.values())
 
-        total = (self.lambda1 * loss_adv_s) + (self.lambda2 * loss_cyc) + (self.lambda3 * loss_isg)
-        return total, {"loss_adv_s": loss_adv_s.item(), "loss_cyc": loss_cyc.item(), "loss_isg": loss_isg.item()}
+        total = loss_adv_g + self.lambda1 * loss_adv_s + self.lambda2 * loss_cyc + self.lambda3 * loss_isg
+        return total, {
+            "loss_adv_g": loss_adv_g.item(), "loss_adv_s": loss_adv_s.item(),
+            "loss_cyc_x": loss_cyc_x.item(), "loss_cyc_y": loss_cyc_y.item(),
+            "loss_isg": loss_isg.item(),
+        }

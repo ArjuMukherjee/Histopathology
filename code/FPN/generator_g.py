@@ -50,22 +50,17 @@ class CoModulatedGenerator(nn.Module):
       - Affine Co-Modulation Fusion: s = A(E(x), M(z))
       - Synthesis Network D with weight-demodulated convolutions and multi-scale skip connections from E
     """
-    def __init__(self, in_channels=1, out_channels=3, z_dim=512, style_dim=512):
+    def __init__(self, in_channels=1, out_channels=3, z_dim=512, style_dim=512, enc_dim=1024, mapping_layers=8):
         super().__init__()
         self.z_dim = z_dim
         self.style_dim = style_dim
+        cond_dim = enc_dim + style_dim          # [E(x), w] concatenated -> per-layer affine A (Eq. 4)
 
-        # 1. Stochastic Style Mapping Network M: z -> w (8-layer MLP)
-        self.mapping_net = nn.Sequential(
-            nn.Linear(z_dim, style_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(style_dim, style_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(style_dim, style_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(style_dim, style_dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        # 1. Stochastic Style Mapping Network M: z -> w (8 FC layers, StyleGAN2)
+        layers = []
+        for _ in range(mapping_layers):
+            layers += [nn.Linear(z_dim if not layers else style_dim, style_dim), nn.LeakyReLU(0.2, inplace=True)]
+        self.mapping_net = nn.Sequential(*layers)
 
         # 2. Conditioning Encoder E (Mask x -> multi-scale feature maps + E(x))
         self.enc1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
@@ -75,45 +70,41 @@ class CoModulatedGenerator(nn.Module):
         self.down4 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e5: 32  -> 16  (512 ch)
         self.down5 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e6: 16  -> 8   (512 ch)
         self.down6 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e7: 8   -> 4   (512 ch)
+        self.enc_conv = nn.Conv2d(512, 512, kernel_size=3, padding=1)          # Conv 3x3 at 4x4 (Fig. 3)
 
+        # Fig. 3: 512x4x4 -> FC (1x1024) -> dropout 0.5  ==> E(x)
         self.enc_fc = nn.Sequential(
             nn.Flatten(),
+            nn.Linear(512 * 4 * 4, enc_dim),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(512 * 4 * 4, style_dim),
-            nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # Initial 4x4 spatial feature map projection for D
-        self.init_proj = nn.Linear(style_dim, 512 * 4 * 4)
-
-        # Co-modulation Affine Transformation: [E(x), w] -> style vector s
-        self.fusion = nn.Sequential(
-            nn.Linear(style_dim * 2, style_dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        # FC -> reshape to 512x4x4: replaces StyleGAN2's constant input
+        self.init_proj = nn.Linear(enc_dim, 512 * 4 * 4)
 
         # 3. Synthesis Network D with Modulated Convolutions & Skip Connections from E
-        self.mod1 = ModulatedConv2d(512, 512, 3, style_dim)
+        self.mod1 = ModulatedConv2d(512, 512, 3, cond_dim)
         self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.skip1 = nn.Conv2d(512, 512, kernel_size=1)
 
-        self.mod2 = ModulatedConv2d(512, 512, 3, style_dim)
+        self.mod2 = ModulatedConv2d(512, 512, 3, cond_dim)
         self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.skip2 = nn.Conv2d(512, 512, kernel_size=1)
 
-        self.mod3 = ModulatedConv2d(512, 256, 3, style_dim)
+        self.mod3 = ModulatedConv2d(512, 256, 3, cond_dim)
         self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.skip3 = nn.Conv2d(512, 256, kernel_size=1)
 
-        self.mod4 = ModulatedConv2d(256, 128, 3, style_dim)
+        self.mod4 = ModulatedConv2d(256, 128, 3, cond_dim)
         self.up4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.skip4 = nn.Conv2d(256, 128, kernel_size=1)
 
-        self.mod5 = ModulatedConv2d(128, 64, 3, style_dim)
+        self.mod5 = ModulatedConv2d(128, 64, 3, cond_dim)
         self.up5 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.skip5 = nn.Conv2d(128, 64, kernel_size=1)
 
-        self.mod6 = ModulatedConv2d(64, 32, 3, style_dim)
+        self.mod6 = ModulatedConv2d(64, 32, 3, cond_dim)
         self.up6 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
 
         # Final RGB color projection
@@ -132,13 +123,14 @@ class CoModulatedGenerator(nn.Module):
         e5 = F.leaky_relu(self.down4(e4), 0.2)  # [B, 512, 16, 16]
         e6 = F.leaky_relu(self.down5(e5), 0.2)  # [B, 512, 8, 8]
         e7 = F.leaky_relu(self.down6(e6), 0.2)  # [B, 512, 4, 4]
+        e7 = F.leaky_relu(self.enc_conv(e7), 0.2)
 
-        E_x = self.enc_fc(e7)
-        w = self.mapping_net(z)
-        style_s = self.fusion(torch.cat([E_x, w], dim=1))
+        E_x = self.enc_fc(e7)                                   # conditional style  E(x)  [B, 1024]
+        w = self.mapping_net(z)                                 # stochastic style   M(z)  [B, 512]
+        style_s = torch.cat([E_x, w], dim=1)                    # s = A(E(x), M(z)): A is each layer's affine (Eq. 4)
 
         # 2. Synthesis Network D
-        h = self.init_proj(E_x).view(B, 512, 4, 4)
+        h = self.init_proj(E_x).view(B, 512, 4, 4)              # replaces StyleGAN2 constant input
         h = F.leaky_relu(self.mod1(h, style_s), 0.2)
 
         h = self.up1(h) + self.skip1(e6)      # 4  -> 8
