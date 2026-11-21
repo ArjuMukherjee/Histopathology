@@ -5,18 +5,17 @@ import argparse
 
 
 def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_radius=9,
-                          num_vertices=48, distributiveness=0.33, nuclei_range=(15, 115),
+                          num_vertices=48, nuclei_range=(15, 115),
                           oblong_prob=0.7, elongation_range=(1.4, 2.6), boundary_px=1):
-    """distributiveness in [0, 1]:
-    0.0 -> tight clumps, nuclei may touch, strong clustering
-    1.0 -> evenly spread, well-separated nuclei
+    """Distributiveness is drawn per mask from a Beta(1, 2.5) scaled to [0, 2] (skewed towards 0):
+    ~0 -> tight clumps, strong clustering;  ~2 -> evenly spread, widely separated nuclei.
     num_nuclei=None -> count drawn uniformly from nuclei_range (default 15..115).
     oblong_prob      -> fraction of nuclei drawn as randomly oriented ellipses (axis ratio from elongation_range).
     boundary_px      -> every nucleus is separated from its neighbours by at least this many background pixels,
                         like the clear inter-nuclear boundary in real MoNuSeg masks (no merged blobs).
     """
     h, w = size
-    d = float(np.clip(distributiveness, 0.0, 1.0))
+    d = float(2.0 * np.random.beta(1.0, 2.5))     # in [0, 2], mean ~0.57, mostly low
     if num_nuclei is None:
         actual_nuclei = int(np.random.randint(nuclei_range[0], nuclei_range[1] + 1))
     else:
@@ -30,7 +29,7 @@ def generate_polygon_mask(size=(512, 512), num_nuclei=None, min_radius=4, max_ra
     ])
 
     placed_centers = []
-    cluster_prob = 0.7 - 0.4 * d            # low d -> mostly clustered
+    cluster_prob = max(0.0, 0.7 - 0.4 * d)  # low d -> mostly clustered; d >= 1.75 -> fully scattered
     spread_lo, spread_hi = 10 + 30 * d, 40 + 90 * d  # low d -> tight clusters
 
     mask = np.zeros(size, dtype=np.uint8)
