@@ -62,10 +62,12 @@ class UNITPathSSLLoss(nn.Module):
         D_S: 1/2 E[(D_S(x) - 1)^2] + 1/2 E[D_S(S(y))^2] + gamma_s/2 * E[||grad D_S(x)||^2]
         S  : 1/2 E[(D_S(S(y)) - 1)^2]                     <-- note: S applied to REAL tissue y
     Eq. 3  L_cyc(G, S) = E[||S(G(x)) - x||_1] + E[||G(S(y)) - y||_1]   (both directions)
+    Eq. 6  L_seg(S)    = Mask R-CNN losses (RPN cls/reg + box cls/reg + mask). This project pretrains
+                         S semantic-only, so lambda3 = 0 is used and seg_loss_dict is left None.
 
     All D_* outputs are raw logits (PatchGAN maps).
     """
-    def __init__(self, lambda1=2.0, lambda2=10.0, lambda3=2.0, gamma_g=10.0, gamma_s=10.0):
+    def __init__(self, lambda1=2.0, lambda2=10.0, lambda3=0.0, gamma_g=10.0, gamma_s=10.0):
         super().__init__()
         self.lambda1, self.lambda2, self.lambda3 = lambda1, lambda2, lambda3
         self.gamma_g, self.gamma_s = gamma_g, gamma_s
