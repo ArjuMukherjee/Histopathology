@@ -18,6 +18,9 @@ class ModulatedConv2d(nn.Module):
         self.weight = nn.Parameter(
             torch.randn(out_channels, in_channels, kernel_size, kernel_size)
         )
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        # Equalized learning rate (StyleGAN2): raw randn weights saturated tanh at the output
+        self.weight_scale = 1.0 / (in_channels * kernel_size ** 2) ** 0.5
         self.affine = nn.Linear(style_dim, in_channels)
 
     def forward(self, x, style):
@@ -26,7 +29,7 @@ class ModulatedConv2d(nn.Module):
         s = self.affine(style).view(B, 1, self.in_channels, 1, 1) + 1.0
 
         # Weight modulation: [B, out_c, in_c, k, k]
-        w = self.weight.unsqueeze(0) * s
+        w = self.weight.unsqueeze(0) * self.weight_scale * s
 
         # Weight demodulation normalization
         d = torch.rsqrt(w.pow(2).sum(dim=[2, 3, 4], keepdim=True) + 1e-8)
@@ -38,7 +41,7 @@ class ModulatedConv2d(nn.Module):
             B * self.out_channels, self.in_channels, self.kernel_size, self.kernel_size
         )
         out = F.conv2d(x, w_demod, padding=self.padding, groups=B)
-        return out.view(B, self.out_channels, H, W)
+        return out.view(B, self.out_channels, H, W) + self.bias.view(1, -1, 1, 1)
 
 
 class CoModulatedGenerator(nn.Module):
@@ -107,8 +110,11 @@ class CoModulatedGenerator(nn.Module):
         self.mod6 = ModulatedConv2d(64, 32, 3, cond_dim)
         self.up6 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
 
-        # Final RGB color projection
+        # Final RGB color projection - zero-init so G starts at tanh(0) = mid-gray and gradient flows
         self.to_rgb = nn.Conv2d(32, out_channels, kernel_size=1)
+        nn.init.zeros_(self.to_rgb.weight)
+        nn.init.zeros_(self.to_rgb.bias)
+        self.skip_scale = 0.5 ** 0.5          # variance-preserving sum of upsampled path + encoder skip
 
     def forward(self, mask_x, z=None):
         B = mask_x.shape[0]
@@ -133,19 +139,19 @@ class CoModulatedGenerator(nn.Module):
         h = self.init_proj(E_x).view(B, 512, 4, 4)              # replaces StyleGAN2 constant input
         h = F.leaky_relu(self.mod1(h, style_s), 0.2)
 
-        h = self.up1(h) + self.skip1(e6)      # 4  -> 8
+        h = (self.up1(h) + self.skip1(e6)) * self.skip_scale      # 4  -> 8
         h = F.leaky_relu(self.mod2(h, style_s), 0.2)
 
-        h = self.up2(h) + self.skip2(e5)      # 8  -> 16
+        h = (self.up2(h) + self.skip2(e5)) * self.skip_scale      # 8  -> 16
         h = F.leaky_relu(self.mod3(h, style_s), 0.2)
 
-        h = self.up3(h) + self.skip3(e4)      # 16 -> 32
+        h = (self.up3(h) + self.skip3(e4)) * self.skip_scale      # 16 -> 32
         h = F.leaky_relu(self.mod4(h, style_s), 0.2)
 
-        h = self.up4(h) + self.skip4(e3)      # 32 -> 64
+        h = (self.up4(h) + self.skip4(e3)) * self.skip_scale      # 32 -> 64
         h = F.leaky_relu(self.mod5(h, style_s), 0.2)
 
-        h = self.up5(h) + self.skip5(e2)      # 64 -> 128
+        h = (self.up5(h) + self.skip5(e2)) * self.skip_scale      # 64 -> 128
         h = F.leaky_relu(self.mod6(h, style_s), 0.2)
 
         h = self.up6(h)                       # 128 -> 256
