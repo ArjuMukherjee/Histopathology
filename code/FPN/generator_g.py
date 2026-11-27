@@ -3,6 +3,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class EqConv2d(nn.Module):
+    """
+    Equalized-learning-rate conv (StyleGAN). Weights are stored ~N(0,1) and scaled by 1/sqrt(fan_in)
+    at runtime so that Adam's fixed-size steps change activations by a bounded amount. With plain
+    nn.Conv2d the same steps were ~30x larger relative to the weights -> activations exploded and
+    the output tanh saturated to +/-1 within a few hundred iterations.
+    """
+    def __init__(self, in_ch, out_ch, k, stride=1, padding=0, lr_mul=1.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_ch, in_ch, k, k) / lr_mul)
+        self.bias = nn.Parameter(torch.zeros(out_ch))
+        self.scale = lr_mul / (in_ch * k * k) ** 0.5
+        self.lr_mul, self.stride, self.padding = lr_mul, stride, padding
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight * self.scale, self.bias * self.lr_mul, stride=self.stride, padding=self.padding)
+
+
+class EqLinear(nn.Module):
+    def __init__(self, in_f, out_f, lr_mul=1.0, bias_init=0.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_f, in_f) / lr_mul)
+        self.bias = nn.Parameter(torch.full((out_f,), bias_init / lr_mul))
+        self.scale, self.lr_mul = lr_mul / in_f ** 0.5, lr_mul
+
+    def forward(self, x):
+        return F.linear(x, self.weight * self.scale, self.bias * self.lr_mul)
+
+
 class ModulatedConv2d(nn.Module):
     """
     Weight demodulation convolutional layer (StyleGAN2 / CoModGAN).
@@ -21,7 +50,7 @@ class ModulatedConv2d(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_channels))
         # Equalized learning rate (StyleGAN2): raw randn weights saturated tanh at the output
         self.weight_scale = 1.0 / (in_channels * kernel_size ** 2) ** 0.5
-        self.affine = nn.Linear(style_dim, in_channels)
+        self.affine = EqLinear(style_dim, in_channels)
 
     def forward(self, x, style):
         B, C, H, W = x.shape
@@ -59,61 +88,60 @@ class CoModulatedGenerator(nn.Module):
         self.style_dim = style_dim
         cond_dim = enc_dim + style_dim          # [E(x), w] concatenated -> per-layer affine A (Eq. 4)
 
-        # 1. Stochastic Style Mapping Network M: z -> w (8 FC layers, StyleGAN2)
+        # 1. Stochastic Style Mapping Network M: z -> w (8 FC layers, StyleGAN2, lr_mul=0.01)
         layers = []
         for _ in range(mapping_layers):
-            layers += [nn.Linear(z_dim if not layers else style_dim, style_dim), nn.LeakyReLU(0.2, inplace=True)]
+            layers += [EqLinear(z_dim if not layers else style_dim, style_dim, lr_mul=0.01), nn.LeakyReLU(0.2, inplace=True)]
         self.mapping_net = nn.Sequential(*layers)
 
         # 2. Conditioning Encoder E (Mask x -> multi-scale feature maps + E(x))
-        self.enc1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
-        self.down1 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)   # e2: 256 -> 128 (128 ch)
-        self.down2 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)  # e3: 128 -> 64  (256 ch)
-        self.down3 = nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1)  # e4: 64  -> 32  (512 ch)
-        self.down4 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e5: 32  -> 16  (512 ch)
-        self.down5 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e6: 16  -> 8   (512 ch)
-        self.down6 = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # e7: 8   -> 4   (512 ch)
-        self.enc_conv = nn.Conv2d(512, 512, kernel_size=3, padding=1)          # Conv 3x3 at 4x4 (Fig. 3)
+        self.enc1 = EqConv2d(in_channels, 64, 3, padding=1)
+        self.down1 = EqConv2d(64, 128, 4, stride=2, padding=1)   # e2: 256 -> 128 (128 ch)
+        self.down2 = EqConv2d(128, 256, 4, stride=2, padding=1)  # e3: 128 -> 64  (256 ch)
+        self.down3 = EqConv2d(256, 512, 4, stride=2, padding=1)  # e4: 64  -> 32  (512 ch)
+        self.down4 = EqConv2d(512, 512, 4, stride=2, padding=1)  # e5: 32  -> 16  (512 ch)
+        self.down5 = EqConv2d(512, 512, 4, stride=2, padding=1)  # e6: 16  -> 8   (512 ch)
+        self.down6 = EqConv2d(512, 512, 4, stride=2, padding=1)  # e7: 8   -> 4   (512 ch)
+        self.enc_conv = EqConv2d(512, 512, 3, padding=1)          # Conv 3x3 at 4x4 (Fig. 3)
 
         # Fig. 3: 512x4x4 -> FC (1x1024) -> dropout 0.5  ==> E(x)
         self.enc_fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(512 * 4 * 4, enc_dim),
+            EqLinear(512 * 4 * 4, enc_dim),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.5),
         )
 
         # FC -> reshape to 512x4x4: replaces StyleGAN2's constant input
-        self.init_proj = nn.Linear(enc_dim, 512 * 4 * 4)
+        self.init_proj = EqLinear(enc_dim, 512 * 4 * 4)
 
         # 3. Synthesis Network D with Modulated Convolutions & Skip Connections from E
         self.mod1 = ModulatedConv2d(512, 512, 3, cond_dim)
         self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.skip1 = nn.Conv2d(512, 512, kernel_size=1)
+        self.skip1 = EqConv2d(512, 512, 1)
 
         self.mod2 = ModulatedConv2d(512, 512, 3, cond_dim)
         self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.skip2 = nn.Conv2d(512, 512, kernel_size=1)
+        self.skip2 = EqConv2d(512, 512, 1)
 
         self.mod3 = ModulatedConv2d(512, 256, 3, cond_dim)
         self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.skip3 = nn.Conv2d(512, 256, kernel_size=1)
+        self.skip3 = EqConv2d(512, 256, 1)
 
         self.mod4 = ModulatedConv2d(256, 128, 3, cond_dim)
         self.up4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.skip4 = nn.Conv2d(256, 128, kernel_size=1)
+        self.skip4 = EqConv2d(256, 128, 1)
 
         self.mod5 = ModulatedConv2d(128, 64, 3, cond_dim)
         self.up5 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.skip5 = nn.Conv2d(128, 64, kernel_size=1)
+        self.skip5 = EqConv2d(128, 64, 1)
 
         self.mod6 = ModulatedConv2d(64, 32, 3, cond_dim)
         self.up6 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
 
         # Final RGB color projection - zero-init so G starts at tanh(0) = mid-gray and gradient flows
-        self.to_rgb = nn.Conv2d(32, out_channels, kernel_size=1)
+        self.to_rgb = EqConv2d(32, out_channels, 1)
         nn.init.zeros_(self.to_rgb.weight)
-        nn.init.zeros_(self.to_rgb.bias)
         self.skip_scale = 0.5 ** 0.5          # variance-preserving sum of upsampled path + encoder skip
 
     def forward(self, mask_x, z=None):
